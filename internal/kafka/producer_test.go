@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	commonpb "github.com/bookingcontrol/booker-contracts-go/v1/common"
+	commonpb "github.com/bookingcontrol/booker-contracts-go/common"
 )
 
 func TestProducer_PublishBookingEvent(t *testing.T) {

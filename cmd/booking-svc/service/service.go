@@ -15,9 +15,9 @@ import (
 	"github.com/bookingcontrol/booker-booking-svc/internal/kafka"
 	"github.com/bookingcontrol/booker-booking-svc/internal/redis"
 	"github.com/bookingcontrol/booker-booking-svc/internal/tracing"
-	commonpb "github.com/bookingcontrol/booker-contracts-go/v1/common"
-	bookingpb "github.com/bookingcontrol/booker-contracts-go/v1/booking"
-	venuepb "github.com/bookingcontrol/booker-contracts-go/v1/venue"
+	commonpb "github.com/bookingcontrol/booker-contracts-go/common"
+	bookingpb "github.com/bookingcontrol/booker-contracts-go/booking"
+	venuepb "github.com/bookingcontrol/booker-contracts-go/venue"
 )
 
 type Service struct {

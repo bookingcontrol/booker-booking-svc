@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/trace"
 
-	commonpb "github.com/bookingcontrol/booker-contracts-go/v1/common"
+	commonpb "github.com/bookingcontrol/booker-contracts-go/common"
 )
 
 type Producer struct {
