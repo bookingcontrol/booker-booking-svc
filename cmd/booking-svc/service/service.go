@@ -67,7 +67,65 @@ func (s *Service) CreateBooking(ctx context.Context, req *bookingpb.CreateBookin
 		return nil, fmt.Errorf("failed to acquire hold: %w", err)
 	}
 	if !acquired {
-		return nil, fmt.Errorf("slot already held")
+		// Hold exists - check if there's an active booking for this slot
+		// If the booking is cancelled/expired/finished, we can clear the hold and retry
+		existingBookingID, err := s.redis.GetHold(ctx, holdKey)
+		if err != nil {
+			// Can't get hold info - might be a race condition or key expired
+			// Try to acquire again in case it was deleted
+			acquired, err = s.redis.SetHold(ctx, holdKey, bookingID, time.Duration(s.cfg.HoldTTLMinutes)*time.Minute)
+			if err != nil {
+				return nil, fmt.Errorf("failed to acquire hold: %w", err)
+			}
+			if !acquired {
+				return nil, fmt.Errorf("slot already held")
+			}
+		} else if existingBookingID != "" {
+			// Check if the existing booking is still active
+			existingBooking, err := s.repo.GetBooking(ctx, existingBookingID)
+			if err == nil && existingBooking != nil {
+				// Only block if booking is in an active state
+				activeStatuses := map[string]bool{
+					"held":     true,
+					"confirmed": true,
+					"seated":   true,
+				}
+				if activeStatuses[existingBooking.Status] {
+					return nil, fmt.Errorf("slot already held")
+				}
+				// Booking is cancelled/expired/finished - clear the stale hold
+				log.Warn().
+					Str("booking_id", existingBookingID).
+					Str("status", existingBooking.Status).
+					Msg("Clearing stale hold for inactive booking")
+				s.redis.DeleteHold(ctx, holdKey)
+				// Retry acquiring hold
+				acquired, err = s.redis.SetHold(ctx, holdKey, bookingID, time.Duration(s.cfg.HoldTTLMinutes)*time.Minute)
+				if err != nil {
+					return nil, fmt.Errorf("failed to acquire hold after clearing stale hold: %w", err)
+				}
+				if !acquired {
+					return nil, fmt.Errorf("slot already held")
+				}
+			} else {
+				// Booking not found or error - clear the stale hold
+				log.Warn().
+					Str("booking_id", existingBookingID).
+					Msg("Clearing stale hold - booking not found")
+				s.redis.DeleteHold(ctx, holdKey)
+				// Retry acquiring hold
+				acquired, err = s.redis.SetHold(ctx, holdKey, bookingID, time.Duration(s.cfg.HoldTTLMinutes)*time.Minute)
+				if err != nil {
+					return nil, fmt.Errorf("failed to acquire hold after clearing stale hold: %w", err)
+				}
+				if !acquired {
+					return nil, fmt.Errorf("slot already held")
+				}
+			}
+		} else {
+			// Can't get hold info - might be a race condition, return error
+			return nil, fmt.Errorf("slot already held")
+		}
 	}
 
 	// Calculate end time
