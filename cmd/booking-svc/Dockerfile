@@ -30,7 +30,8 @@ WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+# Update go.sum and download modules (tidy will fix checksum mismatches)
+RUN go mod tidy
 
 # Copy source code first
 COPY cmd/ ./cmd/
