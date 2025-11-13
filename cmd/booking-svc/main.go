@@ -9,19 +9,22 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/bookingcontrol/booker-booking-svc/cmd/booking-svc/config"
-	"github.com/bookingcontrol/booker-booking-svc/cmd/booking-svc/repository"
-	"github.com/bookingcontrol/booker-booking-svc/cmd/booking-svc/service"
-	"github.com/bookingcontrol/booker-booking-svc/internal/kafka"
-	"github.com/bookingcontrol/booker-booking-svc/internal/metrics"
-	"github.com/bookingcontrol/booker-booking-svc/internal/redis"
-	"github.com/bookingcontrol/booker-booking-svc/internal/tracing"
+	"github.com/bookingcontrol/booker-booking-svc/internal/config"
+	grpcadp "github.com/bookingcontrol/booker-booking-svc/internal/adapter/grpc"
+	postgresadp "github.com/bookingcontrol/booker-booking-svc/internal/adapter/postgres"
+	redisadp "github.com/bookingcontrol/booker-booking-svc/internal/adapter/redis"
+	kafkaadp "github.com/bookingcontrol/booker-booking-svc/internal/adapter/kafka"
+	"github.com/bookingcontrol/booker-booking-svc/internal/usecase/booking"
+	postgresinfra "github.com/bookingcontrol/booker-booking-svc/internal/infrastructure/postgres"
+	redisfinfra "github.com/bookingcontrol/booker-booking-svc/internal/infrastructure/redis"
+	kafkainfra "github.com/bookingcontrol/booker-booking-svc/internal/infrastructure/kafka"
+	"github.com/bookingcontrol/booker-booking-svc/internal/infrastructure/metrics"
+	"github.com/bookingcontrol/booker-booking-svc/internal/infrastructure/tracing"
 	bookingpb "github.com/bookingcontrol/booker-contracts-go/booking"
 	venuepb "github.com/bookingcontrol/booker-contracts-go/venue"
 )
@@ -43,27 +46,24 @@ func main() {
 	defer shutdown()
 
 	// PostgreSQL
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresHost, cfg.PostgresPort, cfg.PostgresDB)
-	
-	pool, err := pgxpool.New(context.Background(), dsn)
+	dbPool, err := postgresinfra.NewPool(cfg.PostgresHost, cfg.PostgresPort, cfg.PostgresDB, cfg.PostgresUser, cfg.PostgresPassword)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to connect to database")
 	}
-	defer pool.Close()
+	defer dbPool.Close()
 
 	// Redis
-	redisClient := redis.NewClient(cfg.RedisAddr, cfg.RedisPassword)
+	redisClient := redisfinfra.NewClient(cfg.RedisAddr, cfg.RedisPassword)
 
 	// Kafka Producer with retry logic
 	kafkaBrokers := []string{cfg.KafkaBrokers}
-	var producer *kafka.Producer
+	var infraProducer *kafkainfra.Producer
 	maxRetries := 20
 	retryDelay := 3 * time.Second
 	log.Info().Strs("brokers", kafkaBrokers).Msg("Attempting to connect to Kafka...")
 	for i := 0; i < maxRetries; i++ {
 		var err error
-		producer, err = kafka.NewProducer(kafkaBrokers)
+		infraProducer, err = kafkainfra.NewProducer(kafkaBrokers)
 		if err == nil {
 			log.Info().Msg("Kafka producer connected successfully")
 			break
@@ -75,10 +75,10 @@ func main() {
 			log.Fatal().Err(err).Int("total_attempts", maxRetries).Msg("Failed to create Kafka producer after all retries")
 		}
 	}
-	if producer == nil {
+	if infraProducer == nil {
 		log.Fatal().Msg("Kafka producer is nil after retry loop")
 	}
-	defer producer.Close()
+	defer infraProducer.Close()
 
 	// Venue gRPC client
 	venueConn, err := grpc.Dial(
@@ -91,20 +91,33 @@ func main() {
 	defer venueConn.Close()
 	venueClient := venuepb.NewVenueServiceClient(venueConn)
 
-	// Repository
-	repo := repository.New(pool, redisClient)
+	// Adapters (реализации domain interfaces)
+	bookingRepo := postgresadp.NewRepository(dbPool)
+	holdRepo := redisadp.NewHoldRepository(redisClient)
+	eventRepo := kafkaadp.NewEventRepository(bookingRepo)
+	kafkaProducer := kafkaadp.NewProducer(infraProducer)
 
-	// Service
-	svc := service.New(repo, producer, venueClient, redisClient, cfg)
+	// Use Case (бизнес-логика)
+	bookingService := booking.NewService(
+		bookingRepo,
+		holdRepo,
+		eventRepo,
+		venueClient,
+		kafkaProducer,
+		cfg,
+	)
+
+	// gRPC Handler (входящий адаптер)
+	grpcHandler := grpcadp.NewHandler(bookingService)
 
 	// Start metrics server
 	startMetricsServer(cfg.MetricsPort)
 
 	// Start outbox worker
-	go svc.StartOutboxWorker(context.Background())
+	go bookingService.StartOutboxWorker(context.Background())
 
 	// Start expired holds worker
-	go svc.StartExpiredHoldsWorker(context.Background())
+	go bookingService.StartExpiredHoldsWorker(context.Background())
 
 	// gRPC Server
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Port))
@@ -115,7 +128,7 @@ func main() {
 	s := grpc.NewServer(
 		grpc.UnaryInterceptor(metrics.UnaryServerMetricsInterceptor("booking-svc")),
 	)
-	bookingpb.RegisterBookingServiceServer(s, svc)
+	bookingpb.RegisterBookingServiceServer(s, grpcHandler)
 
 	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -148,4 +161,3 @@ func main() {
 		s.Stop()
 	}
 }
-
